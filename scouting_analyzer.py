@@ -1,8 +1,9 @@
 import streamlit as st
 import cv2
 import os
-import time
 import json
+import time
+import tempfile
 from dotenv import load_dotenv
 from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
 from moviepy.editor import VideoFileClip
@@ -16,6 +17,8 @@ from azure.search.documents.indexes.models import (
     SearchIndex, SimpleField, SearchableField, SearchFieldDataType
 )
 from azure.core.credentials import AzureKeyCredential
+
+import yt_dlp
 
 # ========== CONFIGURATION ==========
 load_dotenv(override=True)
@@ -53,18 +56,46 @@ with tab1:
         whisper_apiversion = st.text_input("Whisper API Version", value=os.getenv("WHISPER_API_VERSION", "2024-05-01-preview"))
         whisper_model_name = st.text_input("Whisper Deployment Name", value=os.getenv("WHISPER_DEPLOYMENT_NAME", "whisper"))
 
-    file_or_url = st.selectbox("Video source:", ["File"], index=0)
-    audio_transcription = st.checkbox('Transcribe audio', True)
+    file_or_url = st.selectbox("Video source:", ["File", "YouTube URL"], index=0)
+    audio_transcription = st.checkbox('Transcribe audio', False)
     shot_interval = st.number_input('Shot interval in seconds', min_value=0, value=DEFAULT_SHOT_INTERVAL)
     frames_per_second = st.number_input('Frames per second', DEFAULT_FRAMES_PER_SECOND)
     resize = st.number_input("Frames resizing ratio", min_value=0, value=RESIZE_OF_FRAMES)
-    save_frames = st.checkbox('Save the frames to the folder "frames"', True)
     temperature = float(st.number_input('Temperature for the model', DEFAULT_TEMPERATURE))
     system_prompt = st.text_area('System Prompt', SYSTEM_PROMPT)
     user_prompt = st.text_area('User Prompt', USER_PROMPT)
     max_duration = st.number_input('Maximum duration to process (seconds)', 0)
 
-    video_file = st.file_uploader("Upload a video file", type=["mp4", "avi", "mov"])
+    video_file = None
+    video_path = None
+    uploaded_or_downloaded = False
+    temp_files_to_cleanup = []
+
+    if file_or_url == "File":
+        video_file = st.file_uploader("Upload a video file", type=["mp4", "avi", "mov"])
+    else:
+        yt_url = st.text_input("Paste YouTube URL here:", "")
+        if yt_url:
+            if st.button("Download Video"):
+                with st.spinner("Downloading YouTube video..."):
+                    ydl_opts = {
+                        'format': 'mp4/bestvideo+bestaudio/best',
+                        'outtmpl': os.path.join(tempfile.gettempdir(), 'yt_downloaded_video.%(ext)s'),
+                        'noplaylist': True,
+                        'quiet': True,
+                    }
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(yt_url, download=True)
+                        ext = info.get("ext", "mp4")
+                        video_path = os.path.join(tempfile.gettempdir(), f'yt_downloaded_video.{ext}')
+                        uploaded_or_downloaded = True
+                        temp_files_to_cleanup.append(video_path)
+                        st.success(f"Downloaded: {info['title']}")
+                        st.session_state['yt_downloaded_path'] = video_path
+                        st.session_state['yt_title'] = info['title']
+        if 'yt_downloaded_path' in st.session_state:
+            video_path = st.session_state['yt_downloaded_path']
+            uploaded_or_downloaded = True
 
     # ========== OPENAI CLIENTS ==========
     aoai_client = AzureOpenAI(
@@ -87,9 +118,6 @@ with tab1:
         fps = video.get(cv2.CAP_PROP_FPS)
         frames_to_skip = int(fps / frames_per_second)
         curr_frame = 0
-        if output_dir != '':
-            os.makedirs(output_dir, exist_ok=True)
-            frame_count = 1
         while curr_frame < total_frames - 1:
             video.set(cv2.CAP_PROP_POS_FRAMES, curr_frame)
             success, frame = video.read()
@@ -98,11 +126,6 @@ with tab1:
                 height, width, _ = frame.shape
                 frame = cv2.resize(frame, (width // resize, height // resize))
             _, buffer = cv2.imencode(".jpg", frame)
-            if output_dir != '':
-                frame_filename = os.path.join(output_dir, f"{os.path.splitext(os.path.basename(video_path))[0]}_frame_{frame_count}.jpg")
-                with open(frame_filename, "wb") as f:
-                    f.write(buffer)
-                frame_count += 1
             base64Frames.append(base64.b64encode(buffer).decode("utf-8"))
             curr_frame += frames_to_skip
         video.release()
@@ -122,6 +145,8 @@ with tab1:
                 file=open(audio_path, "rb"),
             )
             transcription_text = transcription.text
+            # Clean up temp audio
+            os.remove(audio_path)
         except Exception as ex:
             print(f'ERROR: {ex}')
             transcription_text = ''
@@ -173,7 +198,8 @@ with tab1:
             duration = min(duration, max_duration)
         for start_time in range(0, int(duration), shot_interval):
             end_time = min(start_time + shot_interval, duration)
-            output_file = os.path.join(output_dir, f'{os.path.splitext(os.path.basename(video_path))[0]}_shot_{start_time}-{end_time}_secs.mp4')
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir=output_dir) as tmp_shot:
+                output_file = tmp_shot.name
             ffmpeg_extract_subclip(video_path, start_time, end_time, targetname=output_file)
             yield output_file
 
@@ -212,37 +238,42 @@ with tab1:
 
     # ========== ANALYSIS ==========
     if st.button("Analyze video", use_container_width=True, type='primary'):
-        if video_file is not None:
-            video_title = os.path.splitext(video_file.name)[0]
-            analysis_dir = f"{video_title}_video_analysis"
-            os.makedirs(analysis_dir, exist_ok=True)
-            shots_dir = os.path.join(analysis_dir, "shots")
-            os.makedirs(shots_dir, exist_ok=True)
+        if (file_or_url == "File" and video_file is not None) or (file_or_url == "YouTube URL" and video_path is not None):
+            # If file uploaded, save to temp. If YT, already have path.
+            if file_or_url == "File":
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                    tmp.write(video_file.getbuffer())
+                    video_path = tmp.name
+                temp_files_to_cleanup.append(video_path)
 
-            video_path = os.path.join(analysis_dir, video_file.name)
-            with open(video_path, "wb") as f:
-                f.write(video_file.getbuffer())
+            st.video(video_path)  # Show the video once at top
 
-            # Show the video only ONCE at the top!
-            st.video(video_file)
-
-            # Progress reporting
             total_shots = get_total_shots(video_path, shot_interval, max_duration)
             progress_msg = st.empty()
 
             all_analyses = []
-            for i, shot_path in enumerate(split_video(video_path, shots_dir, shot_interval, max_duration)):
+            temp_shots = []
+            for i, shot_path in enumerate(split_video(video_path, tempfile.gettempdir(), shot_interval, max_duration)):
+                temp_shots.append(shot_path)
                 base64frames = process_video(
                     shot_path,
                     frames_per_second=frames_per_second,
                     resize=resize,
-                    output_dir='frames' if save_frames else '',
+                    output_dir='',   # Not saving frames!
                     temperature=temperature
                 )
                 transcription = process_audio(shot_path) if audio_transcription else ''
                 analysis = analyze_video(base64frames, system_prompt, user_prompt, transcription, temperature)
                 all_analyses.append(analysis)
                 progress_msg.info(f"Analysis {i+1}/{total_shots} complete")
+
+            # Clean up temp shot files
+            for f in temp_shots:
+                try: os.remove(f)
+                except: pass
+            for f in temp_files_to_cleanup:
+                try: os.remove(f)
+                except: pass
 
             concise_summary = generate_summary(
                 all_analyses,
@@ -258,12 +289,13 @@ with tab1:
             st.markdown(concise_summary, unsafe_allow_html=True)
             st.success("Analysis complete. Switch to 'Index & Search' tab to index or chat over the results.")
             st.balloons()
+        else:
+            st.warning("Please upload a video or download a YouTube video first.")
 
 # ========== TAB 2: INDEXING & SEARCH ==========
 with tab2:
     st.header("Index & Search (RAG)")
 
-    # Credentials UI (again, can be made global if preferred)
     search_service_endpoint = st.text_input("Azure Search Endpoint", value=os.getenv("AZURE_SEARCH_SERVICE_ENDPOINT", ""))
     search_api_key = st.text_input("Azure Search API Key", value=os.getenv("AZURE_SEARCH_API_KEY", ""), type="password")
     index_name = st.text_input("Index Name", value="nfl-player-scouting")
@@ -272,7 +304,6 @@ with tab2:
     openai_deployment = st.text_input("OpenAI Deployment Name", value=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o"))
     openai_api_version = st.text_input("OpenAI API Version", value=os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview"))
 
-    # Index button
     if 'analyses' in st.session_state:
         def extract_player_name_and_position(analysis_text):
             import re
@@ -331,10 +362,6 @@ with tab2:
             credential=AzureKeyCredential(search_api_key)
         )
         results = list(search_client.search(query))
-        # st.write("### Top Results")
-        # for r in results[:5]:
-        #     st.markdown(f"**Player:** {r['player_name']} ({r['position']})\n\n{r['content'][:500]}...")
-        # RAG Q&A
         top_docs = "\n\n".join([r['content'] for r in results[:3]])
         prompt = (
             "You are a helpful NFL scouting assistant. Based on the following scouting reports, answer the user's question.\n\n"
